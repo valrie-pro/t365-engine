@@ -228,7 +228,8 @@ Tu reçois ci-dessous :
 - des indicateurs chiffrés (analysis),
 - le contexte utilisateur (intentions).
 
-Tu dois produire UN TEXTE UNIQUE en 3 blocs courts, dans cet ordre, sans titres, sans puces, sans emojis :
+Tu dois produire UN TEXTE UNIQUE en 3 blocs courts, dans cet ordre, SANS TITRE, SANS PUCE, SANS NUMÉROTATION,
+et SANS EMOJIS dans ta réponse :
 
 1) Bloc "lecture globale"
 → Tu expliques ce que montrent les chiffres : niveau de revenus mensuels, niveau de charges,
@@ -246,11 +247,12 @@ mais sans minimiser les enjeux. Tu proposes 2–3 pistes concrètes adaptées
 (ex : réduire certaines dépenses récurrentes, sécuriser un matelas, lisser un découvert,
 préparer un dossier en plusieurs mois…).
 
-RÈGLES DE STYLE :
+RÈGLES DE STYLE (À RESPECTER STRICTEMENT) :
 - Ton = professionnel, clair, cash mais jamais culpabilisant.
 - Tu vouvoies l’utilisateur.
-- Tu restes court : 3 paragraphes de 3–5 phrases chacun maximum.
-- Tu ne répètes pas exactement les mêmes phrases d’un bloc à l’autre.
+- Tu écris EXACTEMENT 3 paragraphes, chacun de 3–5 phrases maximum.
+- Tu ne fais AUCUNE liste, AUCUNE puce, AUCUNE numérotation (pas de "1.", "2.", "-", "•") dans ta réponse.
+- Tu n’ajoutes PAS de sous-titres ni de texte en majuscules.
 - Tu NE cites PAS les champs `goal`, `horizon` ou `feeling` tels quels, tu les traduis en langage naturel.
 - Tu mentionnes le score uniquement si ça apporte quelque chose à la compréhension
   (ex : score bas = profil fragile, score élevé = profil solide mais perfectible).
@@ -271,7 +273,8 @@ DONNÉES EN ENTRÉE (JSON) :
 {donnees}
 
 FORMAT DE SORTIE :
-- Tu renvoies uniquement le texte des 3 paragraphes, séparés par une ligne vide.
+- Tu renvoies uniquement le texte des 3 paragraphes, séparés par UNE LIGNE VIDE.
+- Tu n’utilises jamais de listes ni de numérotation dans ta réponse.
 - À la toute fin, tu ajoutes UNE SEULE phrase finale qui combine :
   1) une invitation douce à aller plus loin avec un rapport détaillé,
   2) et un rappel que cela ne remplace pas un conseil humain.
@@ -281,7 +284,6 @@ Exemple de dernière phrase (à adapter, ne la copie pas mot à mot) :
 mais gardez en tête qu’aucun outil ne remplace l’avis d’un professionnel
 (banque, courtier, conseiller financier) sur votre situation complète."
 """
-
 
 def generate_free_narration(
     analysis: Dict[str, Any],
