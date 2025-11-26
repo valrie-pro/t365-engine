@@ -4,6 +4,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 import csv
 import io
+import requests
 import os
 import json
 import logging
