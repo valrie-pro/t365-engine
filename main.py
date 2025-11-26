@@ -319,13 +319,24 @@ def generate_free_narration(
     try:
         response = client.responses.create(
             model="gpt-4.1-mini",  # modèle léger = coût maîtrisé
-            instructions="Tu es l’IA-conseiller de T365. Suis STRICTEMENT les consignes du prompt utilisateur.",
+            instructions=(
+                "Tu es l’IA-conseiller de T365. "
+                "Suis STRICTEMENT les consignes du prompt utilisateur ci-dessous."
+            ),
             input=prompt,
             max_output_tokens=600,
             temperature=0.5,
         )
 
-        narration_text = getattr(response, "output_text", None)
+        # ⚠️ Nouveau client : on va chercher le texte ici
+        narration_text = None
+        try:
+            first_output = response.output[0]
+            first_content = first_output.content[0]
+            narration_text = getattr(first_content, "text", None)
+        except Exception as e:
+            logger.warning(f"Impossible d'extraire le texte de la réponse IA : {e}")
+
         if not narration_text or not narration_text.strip():
             logger.warning("Narration IA vide ou invalide.")
             return None
