@@ -60,6 +60,14 @@ def root():
 def health():
     return {"status": "ok"}
 
+@app.get("/debug-openai")
+def debug_openai():
+    key = os.environ.get("OPENAI_API_KEY")
+    # ⚠️ On NE renvoie PAS la clé complète (question de sécurité)
+    return {
+        "has_key": bool(key),
+        "prefix": key[:5] + "..." if key else None,
+    }
 
 # ─────────────────────────────────────────
 # Analyse bancaire (CSV canonical)
