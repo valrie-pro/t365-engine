@@ -4,12 +4,14 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 import csv
 import io
-import requests
 import os
 import json
 import logging
+import base64
+import re
 
 from openai import OpenAI
+from pypdf import PdfReader
 
 # ─────────────────────────────────────────
 # Config & client OpenAI
@@ -18,8 +20,7 @@ from openai import OpenAI
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Le client lit OPENAI_API_KEY dans les variables d’environnement (Render)
-client = OpenAI()
+client = OpenAI()  # lit OPENAI_API_KEY dans l'environnement
 
 app = FastAPI(title="T365 Engine - Minimal")
 
@@ -29,14 +30,14 @@ app = FastAPI(title="T365 Engine - Minimal")
 # ─────────────────────────────────────────
 
 class Intentions(BaseModel):
-    # On garde ça générique pour l’instant
     q: Optional[Dict[str, Any]] = None
 
 
 class AnalyzeRequest(BaseModel):
     docType: str = "bank"
-    fileKind: str  # "csv" (on ajoutera pdf plus tard)
+    fileKind: str  # "csv" ou "pdf_base64"
     csvText: Optional[str] = None
+    fileBase64: Optional[str] = None  # pour les PDF encodés
     fileName: Optional[str] = None
     intentions: Optional[Intentions] = None
 
@@ -60,17 +61,9 @@ def root():
 def health():
     return {"status": "ok"}
 
-@app.get("/debug-openai")
-def debug_openai():
-    key = os.environ.get("OPENAI_API_KEY")
-    # ⚠️ On NE renvoie PAS la clé complète (question de sécurité)
-    return {
-        "has_key": bool(key),
-        "prefix": key[:5] + "..." if key else None,
-    }
 
 # ─────────────────────────────────────────
-# Analyse bancaire (CSV canonical)
+# Helpers CSV canonical
 # ─────────────────────────────────────────
 
 def parse_canonical_csv(csv_text: str):
@@ -88,7 +81,8 @@ def parse_canonical_csv(csv_text: str):
     rows = []
     for row in reader:
         try:
-            amount = float(str(row.get("amount", "")).replace(" ", "").replace(",", "."))
+            amount_str = str(row.get("amount", "")).replace(" ", "").replace(",", ".")
+            amount = float(amount_str)
         except ValueError:
             continue
 
@@ -102,6 +96,10 @@ def parse_canonical_csv(csv_text: str):
 
     return rows
 
+
+# ─────────────────────────────────────────
+# Analyse bancaire (chiffres)
+# ─────────────────────────────────────────
 
 def analyze_bank_csv(canonical_csv: str, intentions: Optional[Intentions]) -> Dict[str, Any]:
     """
@@ -180,7 +178,7 @@ def analyze_bank_csv(canonical_csv: str, intentions: Optional[Intentions]) -> Di
 
     summary_line = (
         f"Pour votre projet de compréhension de votre budget, "
-        f"votre taux d’endettement est de {round(debt_ratio * 100)}%, "
+        f"votre taux d’endettement est de {round(debt_ratio * 100)} %, "
         f"charges : {round(-charges_abs, 2)} €, revenus : {round(revenus, 2)} €."
     )
 
@@ -201,16 +199,114 @@ def analyze_bank_csv(canonical_csv: str, intentions: Optional[Intentions]) -> Di
 
 
 # ─────────────────────────────────────────
+# PDF → texte → CSV canonical
+# ─────────────────────────────────────────
+
+DATE_REGEX = re.compile(r"^(\d{2}/\d{2}/\d{4})\b")
+AMOUNT_REGEX = re.compile(r"(-?\d[\d\s]*[.,]\d{2})\s*$")
+
+
+def pdf_bytes_to_text(pdf_bytes: bytes) -> str:
+    """
+    Extrait le texte brut d’un PDF (texte, pas de scan image).
+    """
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    all_text_lines: List[str] = []
+
+    for page in reader.pages:
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+        if not t:
+            continue
+        # On normalise les sauts de ligne
+        lines = t.replace("\r\n", "\n").split("\n")
+        all_text_lines.extend([line.rstrip() for line in lines])
+
+    return "\n".join(all_text_lines)
+
+
+def pdf_text_to_canonical_csv(text: str) -> str:
+    """
+    Très V1 : on cherche des lignes qui ressemblent à :
+    '01/11/2025 ... LIBELLÉ ... -45,67'
+    et on fabrique un CSV 'date,label,amount'.
+    """
+    lines = text.split("\n")
+    rows: List[Dict[str, str]] = []
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # 1) Date au début
+        m_date = DATE_REGEX.match(line)
+        if not m_date:
+            continue
+        date_str = m_date.group(1)
+
+        # 2) Montant à la fin
+        m_amount = AMOUNT_REGEX.search(line)
+        if not m_amount:
+            continue
+        amount_raw = m_amount.group(1)
+
+        # 3) Label = ce qu’il y a entre la date et le montant
+        middle = line[m_date.end(): m_amount.start()].strip()
+        # on nettoie un peu le label
+        label = re.sub(r"\s{2,}", " ", middle)
+
+        # 4) Normalisation du montant
+        amount_clean = amount_raw.replace(" ", "").replace(",", ".")
+        try:
+            amount_val = float(amount_clean)
+        except ValueError:
+            continue
+
+        rows.append(
+            {
+                "date": date_str,
+                "label": label,
+                "amount": f"{amount_val:.2f}",
+            }
+        )
+
+    if not rows:
+        raise ValueError("Impossible d'extraire des lignes de mouvements depuis ce PDF.")
+
+    # Construction du CSV canonical
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=["date", "label", "amount"])
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(r)
+
+    return output.getvalue()
+
+
+def pdf_base64_to_canonical_csv(b64: str) -> str:
+    """
+    Décode un PDF en base64, extrait le texte, puis le convertit en CSV canonical.
+    """
+    try:
+        pdf_bytes = base64.b64decode(b64)
+    except Exception as e:
+        raise ValueError("PDF en base64 invalide.") from e
+
+    text = pdf_bytes_to_text(pdf_bytes)
+    if not text.strip():
+        raise ValueError("Aucun texte exploitable n'a été trouvé dans le PDF.")
+
+    return pdf_text_to_canonical_csv(text)
+
+
+# ─────────────────────────────────────────
 # Helpers IA : intentions + prompt narration FREE
 # ─────────────────────────────────────────
 
 def extract_intentions(intentions: Optional[Intentions]) -> Dict[str, Optional[str]]:
-    """
-    Ramène les intentions à un format simple :
-    { "goal": ..., "horizon": ..., "feeling": ... }
-
-    Gère le cas où intentions.q contient les vraies valeurs.
-    """
     if intentions is None:
         return {"goal": None, "horizon": None, "feeling": None}
 
@@ -226,6 +322,7 @@ def extract_intentions(intentions: Optional[Intentions]) -> Dict[str, Optional[s
         "feeling": feeling,
     }
 
+
 PROMPT_FREE_NARRATION = """
 Tu es l’IA-conseiller interne de T365, un outil d’analyse de relevés bancaires.
 Ton rôle est d’expliquer des chiffres financiers personnels en français simple, de manière professionnelle,
@@ -235,67 +332,67 @@ Tu reçois ci-dessous :
 - des indicateurs chiffrés (analysis),
 - le contexte utilisateur (intentions).
 
-Tu dois produire UN TEXTE UNIQUE en 4 blocs courts, dans cet ordre, SANS TITRE, SANS PUCE,
-SANS NUMÉROTATION, et SANS EMOJIS :
+Tu dois produire UN TEXTE UNIQUE en 4 blocs courts, dans cet ordre, SANS TITRE, SANS PUCE, SANS NUMÉROTATION,
+et SANS EMOJIS dans ta réponse :
 
 1) Bloc "lecture globale"
 → Tu expliques ce que montrent les chiffres : niveau de revenus mensuels, niveau de charges,
 impression générale du budget (large marge / marge confortable / très serré / déficit),
-niveau de taux d’endettement et ce que cela signifie concrètement pour le quotidien.
+niveau de taux d’endettement et ce que ça signifie concrètement pour le quotidien.
 
 2) Bloc "risques à surveiller"
 → Tu décris les fragilités concrètes : absence de marge, dépendance à un seul salaire,
-frais bancaires élevés, endettement important, difficulté probable à faire passer un projet
+frais bancaires élevés, endettement trop important, difficulté probable à faire passer un projet
 (crédit, location…) si c’est le cas. Tu adaptes le ton selon l’objectif et l’horizon.
 
 3) Bloc "coach rassurant mais cash"
-→ Tu parles comme un conseiller qui veut aider : direct, sans dramatiser,
+→ Tu parles comme un conseiller qui veut vraiment aider : direct, sans dramatiser,
 mais sans minimiser les enjeux. Tu proposes 2–3 pistes concrètes adaptées
 (ex : réduire certaines dépenses récurrentes, sécuriser un matelas, lisser un découvert,
 préparer un dossier en plusieurs mois…).
 
-4) Bloc "aller plus loin"
+4) Bloc "aller plus loin et limites de l’outil"
 → Tu expliques en quelques phrases ce que pourrait apporter un rapport plus détaillé
-(vision fine des catégories de dépenses, suivi des charges récurrentes, marges de manœuvre,
-simulation du dossier selon différents objectifs, etc.).
-→ Tu gardes un ton factuel et orienté accompagnement. Tu n’ajoutes PAS de mise en garde juridique
-ni de référence à un conseiller humain (cela sera ajouté hors IA).
+(vision plus fine des catégories de dépenses, des charges récurrentes, de la marge de manœuvre, etc.).
+→ Tu termines ce paragraphe par une phrase qui invite simplement à approfondir l’analyse,
+sans parler de prix, ni d’achat, ni de paiement.
 
 RÈGLES DE STYLE (À RESPECTER STRICTEMENT) :
 - Ton = professionnel, clair, cash mais jamais culpabilisant.
 - Tu vouvoies l’utilisateur.
 - Tu écris EXACTEMENT 4 paragraphes, chacun de 3–5 phrases maximum.
-- Tu ne fais AUCUNE liste, AUCUNE puce, AUCUNE numérotation.
-- Aucun sous-titre, aucune majuscule décorative.
-- Tu ne cites PAS les champs `goal`, `horizon` ou `feeling` tels quels : tu les traduis en langage naturel.
-- Tu mentionnes le score seulement si cela apporte un éclairage utile.
+- Tu ne fais AUCUNE liste, AUCUNE puce, AUCUNE numérotation (pas de "1.", "2.", "-", "•") dans ta réponse.
+- Tu n’ajoutes PAS de sous-titres ni de texte en majuscules.
+- Tu NE cites PAS les champs `goal`, `horizon` ou `feeling` tels quels, tu les traduis en langage naturel.
+- Tu mentionnes le score uniquement si ça apporte quelque chose à la compréhension
+  (ex : score bas = profil fragile, score élevé = profil solide mais perfectible).
 
-PERSONNALISATION :
-- Objectif crédit ou location → insister sur la capacité du dossier et les seuils d’endettement (~35 %).
-- Objectif optimisation → parler équilibre du quotidien et marges de manœuvre.
-- Horizon court (<3 mois) → rappeler que les optimisations rapides priment.
-- Horizon long (>12 mois) → mettre en avant le lissage des ajustements.
-- Si la personne se dit "inquiète", reconnaître le stress mais recentrer sur l’action concrète.
-- Si elle se dit "rassurée", valider seulement si l’endettement ≤ 35 % ; sinon rassurer sans minimiser.
+PERSONNALISATION SELON LES INTENTIONS :
+- Si l’objectif est un crédit immo / conso ou un dossier de location, tu insistes davantage
+  sur la capacité à faire passer un dossier et sur les seuils classiques de taux d’endettement (~35 %).
+- Si l’objectif est "mieux comprendre / optimiser mon budget",
+  tu parles davantage d’équilibre du quotidien et de marge de manœuvre.
+- Si l’horizon est très court ("moins de 3 mois"), tu rappelles qu’il sera difficile
+  de tout transformer rapidement et que chaque petite optimisation compte.
+- Si l’horizon est long ("plus de 12 mois"), tu insistes sur le fait que c’est le bon moment
+  pour lisser les changements.
+- Si la personne se dit "inquiète", tu reconnais le stress mais tu donnes un angle d’action concret.
+- Si elle se dit "rassurée", tu valides seulement si le taux d’endettement ne dépasse pas le seuil classique (~35 %).
+  Si le taux d’endettement dépasse ce seuil, tu restes factuel et tu expliques où rester vigilant.
 
 DONNÉES EN ENTRÉE (JSON) :
 {donnees}
 
 FORMAT DE SORTIE :
 - Tu renvoies uniquement le texte des 4 paragraphes, séparés chacun par UNE LIGNE VIDE.
-- Tu n’utilises jamais de listes ni de numérotation.
+- Tu n’utilises jamais de listes ni de numérotation dans ta réponse.
 """
+
 
 def generate_free_narration(
     analysis: Dict[str, Any],
     intentions: Optional[Intentions] = None,
 ) -> Optional[str]:
-    """
-    Prend l'objet d'analyse (kpi, summaryLine, etc.)
-    + les intentions utilisateur, et renvoie un texte IA (str) OU None en cas d’échec.
-    Utilise l’endpoint chat.completions.
-    """
-
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         logger.warning("OPENAI_API_KEY manquant : narration IA désactivée.")
@@ -332,7 +429,7 @@ def generate_free_narration(
                 },
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=700,
+            max_tokens=900,
             temperature=0.5,
         )
 
@@ -353,8 +450,8 @@ def generate_free_narration(
 
     except Exception as e:
         logger.exception(f"Erreur lors de la génération de la narration FREE : {e}")
-        # cas typique : 429 insufficient_quota
         return None
+
 
 # ─────────────────────────────────────────
 # Endpoint principal /analyze
@@ -363,31 +460,45 @@ def generate_free_narration(
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
     try:
-        if req.fileKind != "csv":
+        # 1) CSV classique
+        if req.fileKind == "csv":
+            if not req.csvText:
+                raise HTTPException(
+                    status_code=400,
+                    detail=ErrorPayload(
+                        code="MISSING_FIELD",
+                        message="Le champ 'csvText' est obligatoire pour fileKind='csv'.",
+                    ).dict(),
+                )
+
+            canonical_csv = req.csvText
+            analysis = analyze_bank_csv(canonical_csv, req.intentions)
+            narration = generate_free_narration(analysis, req.intentions)
+
+        # 2) PDF encodé en base64
+        elif req.fileKind == "pdf_base64":
+            if not req.fileBase64:
+                raise HTTPException(
+                    status_code=400,
+                    detail=ErrorPayload(
+                        code="MISSING_FIELD",
+                        message="Le champ 'fileBase64' est obligatoire pour fileKind='pdf_base64'.",
+                    ).dict(),
+                )
+
+            canonical_csv = pdf_base64_to_canonical_csv(req.fileBase64)
+            analysis = analyze_bank_csv(canonical_csv, req.intentions)
+            narration = generate_free_narration(analysis, req.intentions)
+
+        else:
             raise HTTPException(
                 status_code=400,
                 detail=ErrorPayload(
                     code="UNSUPPORTED_FILE_KIND",
-                    message="Pour l’instant, seul fileKind='csv' est supporté.",
+                    message=f"fileKind='{req.fileKind}' n'est pas supporté.",
                 ).dict(),
             )
 
-        if not req.csvText:
-            raise HTTPException(
-                status_code=400,
-                detail=ErrorPayload(
-                    code="MISSING_FIELD",
-                    message="Le champ 'csvText' est obligatoire pour fileKind='csv'.",
-                ).dict(),
-            )
-
-        # 1) Analyse chiffrée minimale
-        analysis = analyze_bank_csv(req.csvText, req.intentions)
-
-        # 2) Narration IA FREE (optionnelle : None si erreur ou pas de clé)
-        narration = generate_free_narration(analysis, req.intentions)
-
-        # 3) Réponse envoyée au front (Next)
         return {
             "analysisId": None,
             "meta": {
@@ -401,8 +512,18 @@ def analyze(req: AnalyzeRequest):
 
     except HTTPException:
         raise
+    except ValueError as e:
+        # Erreurs “fonctionnelles” (PDF illisible, pas de lignes, etc.)
+        logger.warning(f"Erreur fonctionnelle /analyze : {e}")
+        raise HTTPException(
+            status_code=400,
+            detail=ErrorPayload(
+                code="BAD_DOCUMENT_FORMAT",
+                message=str(e),
+            ).dict(),
+        )
     except Exception as e:
-        print("Unexpected /analyze error:", e)
+        logger.exception("Unexpected /analyze error: %s", e)
         raise HTTPException(
             status_code=500,
             detail=ErrorPayload(
