@@ -4,6 +4,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 import csv
 import io
+import requests
 import os
 import json
 import logging
@@ -37,6 +38,7 @@ class AnalyzeRequest(BaseModel):
     docType: str = "bank"
     fileKind: str  # "csv" ou "pdf_base64"
     csvText: Optional[str] = None
+    fileBase64: Optional[str] = None
     fileBase64: Optional[str] = None  # pour les PDF encodés
     fileName: Optional[str] = None
     intentions: Optional[Intentions] = None
@@ -96,6 +98,93 @@ def parse_canonical_csv(csv_text: str):
 
     return rows
 
+def pdf_base64_to_canonical_csv(pdf_b64: str) -> str:
+    """
+    1) Décode le PDF en base64
+    2) Extrait le texte page par page
+    3) Détecte les lignes de mouvements via une regex souple
+       (date au début, montant à la fin)
+    4) Renvoie un CSV canonical : header date,label,amount
+    """
+
+    if not pdf_b64:
+        logger.warning("pdf_base64_to_canonical_csv: PDF vide.")
+        return ""
+
+    # 1) Décodage base64
+    try:
+        pdf_bytes = base64.b64decode(pdf_b64)
+    except Exception as e:
+        logger.exception("Décodage base64 PDF impossible : %s", e)
+        return ""
+
+    # 2) Extraction du texte
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        text_chunks = []
+        for page in reader.pages:
+            text_chunks.append(page.extract_text() or "")
+        full_text = "\n".join(text_chunks)
+    except Exception as e:
+        logger.exception("Extraction texte PDF impossible : %s", e)
+        return ""
+
+    # Petit log debug : les 40 premières lignes
+    first_lines = "\n".join(full_text.splitlines()[:40])
+    logger.info("Texte PDF — aperçu (40 premières lignes):\n%s", first_lines)
+
+    # 3) Parsing des lignes de mouvements
+    rows = []
+
+    # Exemple de pattern : "31/10/2025  ACHAT CB XXX ....  -123,45"
+    line_pattern = re.compile(
+        r"""
+        ^\s*
+        (?P<date>\d{2}/\d{2}/\d{4})      # date JJ/MM/AAAA
+        \s+
+        (?P<label>.+?)                   # libellé au milieu (le plus court possible)
+        \s+
+        (?P<amount>[+-]?\d[\d\s]*[.,]\d{2})   # montant à la fin, ex 1 234,56 ou -123,45
+        \s*$
+        """,
+        re.VERBOSE,
+    )
+
+    for raw_line in full_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        m = line_pattern.match(line)
+        if not m:
+            continue
+
+        date = (m.group("date") or "").strip()
+        label = (m.group("label") or "").strip()
+        amount_str = (m.group("amount") or "").replace(" ", "").replace(",", ".")
+
+        try:
+            amount = float(amount_str)
+        except ValueError:
+            continue
+
+        rows.append({"date": date, "label": label, "amount": amount})
+
+    if not rows:
+        logger.warning("Aucune ligne de mouvement détectée dans le PDF.")
+        return ""
+
+    # 4) Construction du CSV canonical en mémoire
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["date", "label", "amount"])
+
+    for r in rows:
+        writer.writerow([r["date"], r["label"], f"{r['amount']:.2f}"])
+
+    csv_text = output.getvalue()
+    logger.info("CSV canonical généré depuis PDF (%d lignes).", len(rows))
+    return csv_text
 
 # ─────────────────────────────────────────
 # Analyse bancaire (chiffres)
@@ -460,7 +549,9 @@ def generate_free_narration(
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
     try:
-        # 1) CSV classique
+        # ───────────────
+        # CAS CSV DIRECT
+        # ───────────────
         if req.fileKind == "csv":
             if not req.csvText:
                 raise HTTPException(
@@ -471,12 +562,24 @@ def analyze(req: AnalyzeRequest):
                     ).dict(),
                 )
 
-            canonical_csv = req.csvText
-            analysis = analyze_bank_csv(canonical_csv, req.intentions)
+            analysis = analyze_bank_csv(req.csvText, req.intentions)
             narration = generate_free_narration(analysis, req.intentions)
 
-        # 2) PDF encodé en base64
-        elif req.fileKind == "pdf_base64":
+            return {
+                "analysisId": None,
+                "meta": {
+                    "fileKind": req.fileKind,
+                    "fileName": req.fileName,
+                    "createdAt": datetime.utcnow().isoformat() + "Z",
+                },
+                "analysis": analysis,
+                "narration": narration,
+            }
+
+        # ───────────────
+        # CAS PDF BASE64
+        # ───────────────
+        if req.fileKind == "pdf_base64":
             if not req.fileBase64:
                 raise HTTPException(
                     status_code=400,
@@ -487,43 +590,46 @@ def analyze(req: AnalyzeRequest):
                 )
 
             canonical_csv = pdf_base64_to_canonical_csv(req.fileBase64)
+
+            if not canonical_csv.strip():
+                # PDF lisible mais parser n'a rien trouvé
+                raise HTTPException(
+                    status_code=400,
+                    detail=ErrorPayload(
+                        code="BAD_DOCUMENT_FORMAT",
+                        message="Impossible d'extraire des lignes de mouvements depuis ce PDF.",
+                    ).dict(),
+                )
+
             analysis = analyze_bank_csv(canonical_csv, req.intentions)
             narration = generate_free_narration(analysis, req.intentions)
 
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=ErrorPayload(
-                    code="UNSUPPORTED_FILE_KIND",
-                    message=f"fileKind='{req.fileKind}' n'est pas supporté.",
-                ).dict(),
-            )
+            return {
+                "analysisId": None,
+                "meta": {
+                    "fileKind": req.fileKind,
+                    "fileName": req.fileName,
+                    "createdAt": datetime.utcnow().isoformat() + "Z",
+                },
+                "analysis": analysis,
+                "narration": narration,
+            }
 
-        return {
-            "analysisId": None,
-            "meta": {
-                "fileKind": req.fileKind,
-                "fileName": req.fileName,
-                "createdAt": datetime.utcnow().isoformat() + "Z",
-            },
-            "analysis": analysis,
-            "narration": narration,
-        }
-
-    except HTTPException:
-        raise
-    except ValueError as e:
-        # Erreurs “fonctionnelles” (PDF illisible, pas de lignes, etc.)
-        logger.warning(f"Erreur fonctionnelle /analyze : {e}")
+        # ───────────────
+        # AUTRES TYPES
+        # ───────────────
         raise HTTPException(
             status_code=400,
             detail=ErrorPayload(
-                code="BAD_DOCUMENT_FORMAT",
-                message=str(e),
+                code="UNSUPPORTED_FILE_KIND",
+                message=f"Le type de fichier '{req.fileKind}' n'est pas supporté.",
             ).dict(),
         )
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.exception("Unexpected /analyze error: %s", e)
+        print("Unexpected /analyze error:", e)
         raise HTTPException(
             status_code=500,
             detail=ErrorPayload(
