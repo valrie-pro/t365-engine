@@ -9,6 +9,7 @@ import os
 import json
 import logging
 import base64
+from pdfminer.high_level import extract_text
 import re
 
 from openai import OpenAI
@@ -185,6 +186,146 @@ def pdf_base64_to_canonical_csv(pdf_b64: str) -> str:
     csv_text = output.getvalue()
     logger.info("CSV canonical généré depuis PDF (%d lignes).", len(rows))
     return csv_text
+
+# ─────────────────────────────────────────
+# Extraction PDF → CSV canonique (Lydia / relevé bancaire texte)
+# ─────────────────────────────────────────
+
+DATE_RE = re.compile(r"^(\d{2}/\d{2}/\d{4})\s*(.*)$")
+NUM_RE = re.compile(r"(-?\d+[\.,]\d{2})")
+
+
+def _clean_line(line: str) -> str:
+    return line.strip()
+
+
+def _is_header_or_footer(line: str) -> bool:
+    line = line.strip()
+    if not line:
+        return True
+    prefixes = [
+        "Compte principal",
+        "Mouvements en Euros",
+        "Solde du compte au",
+        "Date Libellé Débit Crédit Solde",
+        "Lydia Solutions SAS",
+        "Adresse médiateur",
+        "Page ",
+    ]
+    return any(line.startswith(p) for p in prefixes)
+
+
+def parse_pdf_statement_text_to_rows(text: str):
+    """
+    Prend le texte brut d'un relevé PDF (ex. Lydia)
+    et renvoie une liste de dicts {date, label, amount}.
+    """
+    lines = [_clean_line(l) for l in text.splitlines()]
+
+    rows = []
+    current = None  # {date, label_parts: [], amount: float|None}
+
+    def flush_current():
+        nonlocal current
+        if current and current.get("amount") is not None:
+            label = " ".join(current.get("label_parts", [])).strip()
+            if label:
+                rows.append(
+                    {
+                        "date": current["date"],
+                        "label": label,
+                        "amount": current["amount"],
+                    }
+                )
+        current = None
+
+    for raw in lines:
+        line = _clean_line(raw)
+        if _is_header_or_footer(line):
+            continue
+
+        # 1) Nouvelle ligne qui commence par une date
+        m = DATE_RE.match(line)
+        if m:
+            flush_current()
+            date = m.group(1)
+            rest = m.group(2).strip()
+            current = {"date": date, "label_parts": [], "amount": None}
+
+            if rest:
+                nums = NUM_RE.findall(rest)
+                if nums:
+                    # Avant-dernier nombre = montant, dernier = solde
+                    amount_str = nums[-2] if len(nums) >= 2 else nums[-1]
+                    amount = float(amount_str.replace(",", "."))
+                    current["amount"] = amount
+                    label_part = NUM_RE.sub("", rest).strip()
+                    if label_part:
+                        current["label_parts"].append(label_part)
+                else:
+                    current["label_parts"].append(rest)
+            continue
+
+        # 2) Ligne sans date : continuation ou montants
+        if not current:
+            continue
+
+        nums = NUM_RE.findall(line)
+        if nums and current.get("amount") is None:
+            # Ligne de montants (ex: "310.00 310.23")
+            amount_str = nums[-2] if len(nums) >= 2 else nums[-1]
+            amount = float(amount_str.replace(",", "."))
+            current["amount"] = amount
+            text_part = NUM_RE.sub("", line).strip()
+            if text_part:
+                current["label_parts"].append(text_part)
+        else:
+            # Juste une suite du libellé
+            if line:
+                current["label_parts"].append(line)
+
+    flush_current()
+
+    return rows
+
+
+def rows_to_canonical_csv(rows) -> str:
+    """
+    Transforme les rows {date, label, amount} en CSV canonique T365
+    (header date,label,amount ; montant déjà signé).
+    """
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["date", "label", "amount"])
+    for r in rows:
+        writer.writerow(
+            [
+                r["date"],
+                r["label"],
+                f"{r['amount']:.2f}".replace(".", ","),  # tu peux laisser le point si tu préfères
+            ]
+        )
+    return output.getvalue()
+
+
+def pdf_base64_to_canonical_csv(pdf_base64: str) -> str:
+    """
+    Décode le PDF (base64), extrait le texte, parse les mouvements,
+    renvoie un CSV canonique prêt pour analyze_bank_csv().
+    """
+    try:
+        pdf_bytes = base64.b64decode(pdf_base64)
+    except Exception as e:
+        raise ValueError(f"PDF base64 invalide: {e}")
+
+    # extraction texte
+    text = extract_text(io.BytesIO(pdf_bytes))
+
+    rows = parse_pdf_statement_text_to_rows(text)
+    if not rows:
+        raise ValueError("Impossible d'extraire des lignes de mouvements depuis ce PDF.")
+
+    return rows_to_canonical_csv(rows)
 
 # ─────────────────────────────────────────
 # Analyse bancaire (chiffres)
@@ -576,20 +717,21 @@ def analyze(req: AnalyzeRequest):
                 "narration": narration,
             }
 
-        # ───────────────
+                # ───────────────
         # CAS PDF BASE64
         # ───────────────
         if req.fileKind == "pdf_base64":
-            if not req.fileBase64:
+            if not req.pdfBase64:
                 raise HTTPException(
                     status_code=400,
                     detail=ErrorPayload(
                         code="MISSING_FIELD",
-                        message="Le champ 'fileBase64' est obligatoire pour fileKind='pdf_base64'.",
+                        message="Le champ 'pdfBase64' est obligatoire pour fileKind='pdf_base64'.",
                     ).dict(),
                 )
 
-            canonical_csv = pdf_base64_to_canonical_csv(req.fileBase64)
+            # PDF (base64) -> CSV canonique
+            canonical_csv = pdf_base64_to_canonical_csv(req.pdfBase64)
 
             if not canonical_csv.strip():
                 # PDF lisible mais parser n'a rien trouvé
