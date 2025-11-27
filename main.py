@@ -321,33 +321,32 @@ def generate_free_narration(
             model="gpt-4.1",
             instructions=(
                 "Tu es l’IA-conseiller de T365. "
-                "Suis STRICTEMENT les consignes du prompt utilisateur ci-dessous."
+                "Suis STRICTEMENT les consignes du prompt utilisateur."
             ),
             input=prompt,
             max_output_tokens=600,
             temperature=0.5,
-            timeout=20,
         )
 
-        # ⚠️ Nouveau client : on va chercher le texte ici
-        narration_text = None
-        try:
-            first_output = response.output[0]
-            first_content = first_output.content[0]
-            narration_text = getattr(first_content, "text", None)
-        except Exception as e:
-            logger.warning(f"Impossible d'extraire le texte de la réponse IA : {e}")
+        # ➜ extraction robuste du texte (nouvelle API OpenAI)
+        text_chunks: List[str] = []
+        for out in response.output:
+            for c in out.content:
+                if hasattr(c, "text") and c.text and getattr(c.text, "value", None):
+                    text_chunks.append(c.text.value)
 
-        if not narration_text or not narration_text.strip():
+        narration_text = "\n".join(text_chunks).strip()
+
+        if not narration_text:
             logger.warning("Narration IA vide ou invalide.")
             return None
 
-        return narration_text.strip()
+        logger.info("Narration FREE générée, longueur=%d caractères", len(narration_text))
+        return narration_text
 
     except Exception as e:
         logger.exception(f"Erreur lors de la génération de la narration FREE : {e}")
         return None
-
 
 # ─────────────────────────────────────────
 # Endpoint principal /analyze
