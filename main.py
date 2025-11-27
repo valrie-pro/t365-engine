@@ -318,7 +318,7 @@ def generate_free_narration(
 
     try:
         response = client.responses.create(
-            model="gpt-4.1-mini",  # modèle léger = coût maîtrisé
+            model="gpt-4.1",
             instructions=(
                 "Tu es l’IA-conseiller de T365. "
                 "Suis STRICTEMENT les consignes du prompt utilisateur ci-dessous."
@@ -326,6 +326,7 @@ def generate_free_narration(
             input=prompt,
             max_output_tokens=600,
             temperature=0.5,
+            timeout=20,
         )
 
         # ⚠️ Nouveau client : on va chercher le texte ici
