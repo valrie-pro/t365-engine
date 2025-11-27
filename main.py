@@ -292,12 +292,15 @@ def generate_free_narration(
     """
     Prend l'objet d'analyse (kpi, summaryLine, etc.)
     + les intentions utilisateur, et renvoie un texte IA (str) OU None en cas d’échec.
+    Utilise l’endpoint chat.completions (structure simple et fiable).
     """
 
+    # 0) Protection : pas de clé = pas d’IA
     if not os.environ.get("OPENAI_API_KEY"):
         logger.warning("OPENAI_API_KEY manquant : narration IA désactivée.")
         return None
 
+    # 1) Préparation des données passées au prompt
     kpi = analysis.get("kpi") or {}
 
     data_for_prompt = {
@@ -317,31 +320,42 @@ def generate_free_narration(
     )
 
     try:
-        response = client.responses.create(
-            model="gpt-4.1",
-            instructions=(
-                "Tu es l’IA-conseiller de T365. "
-                "Suis STRICTEMENT les consignes du prompt utilisateur."
-            ),
-            input=prompt,
-            max_output_tokens=600,
+        # 2) Appel OpenAI via chat.completions
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",  # léger + fiable pour ce cas
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Tu es l’IA-conseiller de T365. "
+                        "Respecte STRICTEMENT les consignes du prompt utilisateur."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            max_tokens=700,
             temperature=0.5,
         )
 
-        # ➜ extraction robuste du texte (nouvelle API OpenAI)
-        text_chunks: List[str] = []
-        for out in response.output:
-            for c in out.content:
-                if hasattr(c, "text") and c.text and getattr(c.text, "value", None):
-                    text_chunks.append(c.text.value)
+        # 3) Extraction du texte
+        if not resp.choices or not resp.choices[0].message:
+            logger.warning("Réponse IA sans choix exploitable.")
+            return None
 
-        narration_text = "\n".join(text_chunks).strip()
+        narration_text = resp.choices[0].message.content or ""
+        narration_text = narration_text.strip()
 
         if not narration_text:
             logger.warning("Narration IA vide ou invalide.")
             return None
 
-        logger.info("Narration FREE générée, longueur=%d caractères", len(narration_text))
+        logger.info(
+            "Narration FREE générée avec succès (longueur=%d caractères).",
+            len(narration_text),
+        )
         return narration_text
 
     except Exception as e:
