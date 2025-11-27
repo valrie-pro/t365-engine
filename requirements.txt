@@ -3,3 +3,4 @@ uvicorn
 pydantic
 requests
 openai>=1.0.0
+pypdf
