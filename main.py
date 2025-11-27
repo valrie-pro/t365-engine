@@ -298,20 +298,16 @@ def generate_free_narration(
     intentions: Optional[Intentions] = None,
 ) -> Optional[str]:
     """
-    DEBUG : version sans try/except pour voir clairement les erreurs OpenAI.
+    Prend l'objet d'analyse (kpi, summaryLine, etc.)
+    + les intentions utilisateur, et renvoie un texte IA (str) OU None en cas d’échec.
+    Utilise l’endpoint chat.completions.
     """
 
-    logger.info("⚙️ generate_free_narration() démarré")
-
-    # 0) Protection : pas de clé = pas d’IA
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         logger.warning("OPENAI_API_KEY manquant : narration IA désactivée.")
         return None
-    else:
-        logger.info("OPENAI_API_KEY détectée (longueur = %d)", len(api_key))
 
-    # 1) Préparation des données passées au prompt
     kpi = analysis.get("kpi") or {}
 
     data_for_prompt = {
@@ -330,46 +326,42 @@ def generate_free_narration(
         donnees=json.dumps(data_for_prompt, ensure_ascii=False, indent=2)
     )
 
-    logger.info("Appel OpenAI chat.completions imminent...")
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Tu es l’IA-conseiller de T365. "
+                        "Respecte STRICTEMENT les consignes du prompt utilisateur."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=700,
+            temperature=0.5,
+        )
 
-    # 2) Appel OpenAI via chat.completions
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Tu es l’IA-conseiller de T365. "
-                    "Respecte STRICTEMENT les consignes du prompt utilisateur."
-                ),
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-        max_tokens=700,
-        temperature=0.5,
-    )
+        if not resp.choices or not resp.choices[0].message:
+            logger.warning("Réponse IA sans choix exploitable.")
+            return None
 
-    logger.info("Réponse OpenAI reçue : %s", resp)
+        narration_text = (resp.choices[0].message.content or "").strip()
+        if not narration_text:
+            logger.warning("Narration IA vide ou invalide.")
+            return None
 
-    if not resp.choices or not resp.choices[0].message:
-        logger.warning("Réponse IA sans choix exploitable.")
+        logger.info(
+            "Narration FREE générée avec succès (longueur=%d caractères).",
+            len(narration_text),
+        )
+        return narration_text
+
+    except Exception as e:
+        logger.exception(f"Erreur lors de la génération de la narration FREE : {e}")
+        # cas typique : 429 insufficient_quota
         return None
-
-    narration_text = resp.choices[0].message.content or ""
-    narration_text = narration_text.strip()
-
-    if not narration_text:
-        logger.warning("Narration IA vide ou invalide.")
-        return None
-
-    logger.info(
-        "Narration FREE générée avec succès (longueur=%d caractères).",
-        len(narration_text),
-    )
-    return narration_text
 
 # ─────────────────────────────────────────
 # Endpoint principal /analyze
