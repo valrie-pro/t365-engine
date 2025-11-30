@@ -717,7 +717,7 @@ def analyze(req: AnalyzeRequest):
                 "narration": narration,
             }
 
-                # ───────────────
+        # ───────────────
         # CAS PDF BASE64
         # ───────────────
         if req.fileKind == "pdf_base64":
