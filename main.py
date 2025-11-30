@@ -40,7 +40,6 @@ class AnalyzeRequest(BaseModel):
     fileKind: str  # "csv" ou "pdf_base64"
     csvText: Optional[str] = None
     fileBase64: Optional[str] = None
-    fileBase64: Optional[str] = None  # pour les PDF encodés
     fileName: Optional[str] = None
     intentions: Optional[Intentions] = None
 
@@ -721,20 +720,19 @@ def analyze(req: AnalyzeRequest):
         # CAS PDF BASE64
         # ───────────────
         if req.fileKind == "pdf_base64":
-            if not req.pdfBase64:
+            if not req.fileBase64:
                 raise HTTPException(
                     status_code=400,
                     detail=ErrorPayload(
                         code="MISSING_FIELD",
-                        message="Le champ 'pdfBase64' est obligatoire pour fileKind='pdf_base64'.",
+                        message="Le champ 'fileBase64' est obligatoire pour fileKind='pdf_base64'.",
                     ).dict(),
                 )
 
-            # PDF (base64) -> CSV canonique
-            canonical_csv = pdf_base64_to_canonical_csv(req.pdfBase64)
+            # ⚠️ ICI : on utilise bien fileBase64, pas pdfBase64
+            canonical_csv = pdf_base64_to_canonical_csv(req.fileBase64)
 
             if not canonical_csv.strip():
-                # PDF lisible mais parser n'a rien trouvé
                 raise HTTPException(
                     status_code=400,
                     detail=ErrorPayload(
